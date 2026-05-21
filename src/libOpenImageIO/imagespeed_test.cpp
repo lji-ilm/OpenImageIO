@@ -22,11 +22,11 @@ using namespace OIIO;
 
 static bool verbose      = false;
 static int iterations    = 1;
-static int ntrials       = 1;
+static int ntrials       = 5;
 static int numthreads    = 0;
 static int autotile_size = 64;
 static bool iter_only    = false;
-static bool no_iter      = false;
+static bool run_iter     = false;
 static std::string conversionname;
 static TypeDesc conversion = TypeDesc::UNKNOWN;  // native by default
 static std::vector<ustring> input_filename;
@@ -63,8 +63,8 @@ getargs(int argc, char* argv[])
       .help(Strutil::fmt::format("Autotile size (when used; default: {})", autotile_size));
     ap.arg("--iteronly", &iter_only)
       .help("Run ImageBuf iteration tests only (not read tests)");
-    ap.arg("--noiter", &no_iter)
-      .help("Don't run ImageBuf iteration tests");
+    ap.arg("--run_iter", &run_iter)
+      .help("Run ImageBuf iteration tests");
     ap.arg("--convert %s", &conversionname)
       .help("Convert to named type upon read (default: native)");
     ap.arg("--cache %f", &cache_size)
@@ -108,6 +108,43 @@ time_read_scanline_at_a_time()
         for (int y = 0; y < spec.height; ++y) {
             in->read_scanline(y + spec.y, 0, conversion,
                               &buffer[scanlinesize * y]);
+        }
+        in->close();
+    }
+}
+
+
+
+// Read the center 60% of scanline ranges
+// Starting from floor(max_Y * 0.2) to floor(max_Y * 0.8)
+static void
+time_read_scanline_range()
+{
+    for (ustring filename : input_filename) {
+        auto in = ImageInput::open(filename.c_str());
+        OIIO_ASSERT(in);
+        const ImageSpec& spec(in->spec());
+        size_t pixelsize = spec.nchannels * conversion.size();
+        if (!pixelsize)
+            pixelsize = spec.pixel_bytes(true);  // UNKNOWN -> native
+        imagesize_t scanlinesize = spec.width * pixelsize;
+        int ybegin = (int)(spec.height * 0.2);
+        int yend = (int)(spec.height * 0.8);
+        if (yend > ybegin){
+            //std::cout << " scanline_range: ybegin: " << ybegin << " yend: " << yend << std::endl;
+            in->read_scanlines(0, // subimage
+                            0, // miplevel
+                            ybegin, // y begin
+                            yend, // y end
+                            0, // z
+                            0, // ch begin
+                            spec.nchannels, //ch end
+                            conversion,
+                            &buffer[scanlinesize * ybegin]);
+            }
+        else
+        {
+            std::cout << " scanline_range did not run because the image does not have enough number of scanlines." << std::endl;
         }
         in->close();
     }
@@ -172,10 +209,12 @@ test_read(const std::string& explanation, void (*func)(), int autotile = 64,
     imagecache->invalidate_all(true);  // Don't hold anything
     imagecache->attribute("autotile", autotile);
     imagecache->attribute("autoscanline", autoscanline);
-    double t    = time_trial(func, ntrials);
-    double rate = double(total_image_pixels) / t;
-    OIIO::print("  {}: {} = {:5.1f} Mpel/s\n", explanation,
-                Strutil::timeintervalformat(t, 2), rate / 1.0e6);
+    double min, max, stddev;
+    double ave  = OpenImageIO::v3_1::time_trial_and_report(func, ntrials, 1, &min, &max, &stddev);
+    //double rate = double(total_image_pixels) / ave;
+    //Remove mpel calculation because not all benchmarks read the whole image into memory
+    OIIO::print(" {}, {}, {}, {}, {} \n", explanation,
+                ave, min, max, stddev);
 }
 
 
@@ -515,7 +554,7 @@ main(int argc, char** argv)
         all_scanline &= (spec.tile_width == 0);
     }
     imagecache->invalidate_all(true);  // Don't hold anything
-
+    std::cout << "Trails: " << ntrials << std::endl;
     if (!iter_only) {
         std::cout << "Timing various ways of reading images:\n";
         if (conversion == TypeDesc::UNKNOWN)
@@ -525,6 +564,8 @@ main(int argc, char** argv)
             std::cout << "    ImageInput reads will convert data to "
                       << conversion << "\n";
         buffer.resize(maxpelchans * sizeof(float), 0);
+
+        std::cout << "Test Name                                     ,    AVERAGE TIME,    MIN TIME,    MAX TIME,    STDDEV,    Mpel/s" << "\n";
         test_read("read_image                                   ",
                   time_read_image, 0, 0);
         if (all_scanline) {
@@ -532,6 +573,8 @@ main(int argc, char** argv)
                       time_read_scanline_at_a_time, 0, 0);
             test_read("read_scanlines (64 at a time)                ",
                       time_read_64_scanlines_at_a_time, 0, 0);
+            test_read("read_scanline_range (center 60%)             ",
+                      time_read_scanline_range, 0, 0);
         }
         test_read("ImageBuf read                                ",
                   time_read_imagebuf, 0, 0);
@@ -595,7 +638,7 @@ main(int argc, char** argv)
         std::cout << std::endl;
     }
 
-    if (!no_iter) {
+    if (run_iter) {
         const int iters = 64;
         std::cout << "Timing ways of iterating over an image:\n";
         test_pixel_iteration("Loop pointers on loaded image (\"1D\")    ",
