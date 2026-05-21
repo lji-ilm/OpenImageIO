@@ -343,6 +343,55 @@ time_trial(FUNC func, int ntrials = 1, int nrepeats = 1, double* range = NULL)
     return mintime;
 }
 
+/// A similiar helper function but returns MAX, MIN, AVERAGE and STDDEV of a number of trails.
+/// The return value is the average. Other computed parameters are returned on pointers.
+template<typename FUNC>
+double
+time_trial_and_report(FUNC func,
+                      int ntrials = 1,
+                      int nrepeats = 1,
+                      double* min = NULL,
+                      double* max = NULL,
+                      double* stddev = NULL)
+{
+    double mintime = 1.0e30, maxtime = 0.0, sum = 0;
+    double mean = 0, M2 = 0, delta = 0;
+    int n = 0;
+    while (ntrials-- > 0) {
+        Timer timer;
+        for (int i = 0; i < nrepeats; ++i) {
+            // Be sure that the repeated calls to func aren't optimized away:
+            clobber_all_memory();
+            func();
+        }
+        double t = timer();
+        if (t < mintime)
+            mintime = t;
+        if (t > maxtime)
+            maxtime = t;
+        // Fllowing math.stackexchange question 198336
+        n += 1;
+        sum += t;
+        delta = t - mean;
+        mean += delta / (double)n;
+        M2 += delta*(t - mean);
+    }
+    if (min)
+        *min = mintime;
+    if (max)
+        *max = maxtime;
+    if (stddev)
+    {
+        if (n < 2)
+            *stddev = 0;
+        else
+            *stddev = M2 / (double)(n - 1);
+    }
+    if (n > 0)
+        return sum / (double)(n);
+    else
+        return 0;
+}
 
 
 // Benchmarking helper function: Time a function with various thread counts.
