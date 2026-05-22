@@ -142,6 +142,7 @@ time_read_64_scanlines_at_a_time()
 
 // Read the center 60% of scanline ranges
 // Starting from floor(max_Y * 0.2) to floor(max_Y * 0.8)
+// This range is perscribed and is not adjusted through the experiments -- see paper
 static void
 time_read_scanline_range()
 {
@@ -177,6 +178,7 @@ time_read_scanline_range()
 
 
 
+
 static void
 time_read_one_tile_at_a_time()
 {
@@ -189,7 +191,7 @@ time_read_one_tile_at_a_time()
             pixelsize = spec.pixel_bytes(true);  // UNKNOWN -> native
         if (spec.tile_width == 0)
         {
-            std::cout << " read_one_tile_at_a_time cannot be applied to scanline images." << std::endl;
+            std::cout << " read_one_tile_at_a_time cannot be applied to scanline image:"<< filename << std::endl;
             return;
         }
         // Refer to OIIO API documentation of tiled input
@@ -212,6 +214,126 @@ time_read_one_tile_at_a_time()
         in->close();
     }
 }
+
+
+
+static void
+time_read_tile_row_at_a_time()
+{
+        for (ustring filename : input_filename) {
+        auto in = ImageInput::open(filename.c_str());
+        OIIO_ASSERT(in);
+        const ImageSpec& spec(in->spec());
+        size_t pixelsize = spec.nchannels * conversion.size();
+        if (!pixelsize)
+            pixelsize = spec.pixel_bytes(true);  // UNKNOWN -> native
+        if (spec.tile_width == 0)
+        {
+            std::cout << " read_one_tile_row_at_a_time cannot be applied to scanline image:" << filename << std::endl;
+            return;
+        }
+        // Refer to OIIO API documentation of tiled input
+        int tile_row_size = spec.width * spec.tile_height * pixelsize;
+        int ntilerow = 0;
+        for (int y = spec.y; y < spec.y + spec.height; y += spec.tile_height)
+        {
+            in->read_tiles(0, 0, // subimage, miplevel
+                        0, spec.width,
+                        y, std::min(y + spec.tile_height, spec.height),
+                        0, 1, //z
+                        0, spec.nchannels, //channels
+                        conversion, //pixelformat
+                        &buffer[tile_row_size * ntilerow]);
+            ntilerow += 1;
+        }
+        in->close();
+    }
+}
+
+
+
+static void
+time_read_tile_column_at_a_time()
+{
+        for (ustring filename : input_filename) {
+        auto in = ImageInput::open(filename.c_str());
+        OIIO_ASSERT(in);
+        const ImageSpec& spec(in->spec());
+        size_t pixelsize = spec.nchannels * conversion.size();
+        if (!pixelsize)
+            pixelsize = spec.pixel_bytes(true);  // UNKNOWN -> native
+        if (spec.tile_width == 0)
+        {
+            std::cout << " read_one_tile_column_at_a_time cannot be applied to scanline image: " << filename << std::endl;
+            return;
+        }
+        // Refer to OIIO API documentation of tiled input
+        int tile_column_size = spec.tile_width * spec.height * pixelsize;
+        int ntilecolumn = 0;
+        for (int x = spec.x; x < spec.x + spec.width; x += spec.tile_width)
+        {
+            in->read_tiles(0, 0, // subimage, miplevel
+                        x, std::min(x + spec.tile_width, spec.width),
+                        0, spec.height,
+                        0, 1, //z
+                        0, spec.nchannels, //channels
+                        conversion, //pixelformat
+                        &buffer[tile_column_size * ntilecolumn]);
+                        // Note that the pointer addresses are wrong if someone want to make use of the read-in data
+                        // Column reads are typically traspose of the native data format, and the tile being read could also 
+                        // still be row-major inside the individual tile read.
+                        // However, we're only timing reading performance and not making use of the read-in data.
+            ntilecolumn += 1;
+        }
+        in->close();
+    }
+}
+
+
+
+// Read the center 60% (both X and Y) of the image via calling read_tiles
+// The range is perscribed and not to be changed, see paper
+// Let read_tile figure out how many tiles are required
+static void
+time_read_tile_range()
+{
+        for (ustring filename : input_filename) {
+        auto in = ImageInput::open(filename.c_str());
+        OIIO_ASSERT(in);
+        const ImageSpec& spec(in->spec());
+        size_t pixelsize = spec.nchannels * conversion.size();
+        if (!pixelsize)
+            pixelsize = spec.pixel_bytes(true);  // UNKNOWN -> native
+        if (spec.tile_width == 0)
+        {
+            std::cout << " read_tile_range cannot be applied to scanline image: " << filename << std::endl;
+            return;
+        }
+        int xbegin = (int)(spec.width * 0.2);
+        int xend = (int)(spec.width * 0.8);
+
+        int ybegin = (int)(spec.height * 0.2);
+        int yend = (int)(spec.height * 0.8);
+
+        if ((xend > xbegin) && (yend > ybegin))
+        {
+            std::cout << " parameters for read_tiles: x:" << xbegin << ", " << xend << " y:" << ybegin << ", " << yend << std::endl;
+            in->read_tiles(0, 0, // subimage, miplevel
+                            xbegin, xend,
+                            ybegin, yend,
+                            0, 1, //z
+                            0, spec.nchannels, //channels
+                            conversion, //pixelformat
+                            &buffer[(ybegin * spec.width + xbegin) * pixelsize]);
+        }
+        else
+        {
+            std::cout << " image is too small to carry out read tile range: " << filename << std::endl;
+        };
+        in->close();
+    }
+}
+
 
 
 static void
@@ -626,6 +748,12 @@ main(int argc, char** argv)
         if (all_tile) {
             test_read("read_tile (1 at a time)                       ",
                       time_read_one_tile_at_a_time, 0, 0);
+            test_read("read_tile_row_at_a_time                       ",
+                      time_read_tile_row_at_a_time, 0, 0);
+            test_read("read_tile_column_at_a_time                    ",
+                      time_read_tile_column_at_a_time, 0, 0);
+            test_read("read_tile_range                               ",
+                      time_read_tile_range, 0, 0);
         }
         test_read("ImageBuf read                                ",
                   time_read_imagebuf, 0, 0);
