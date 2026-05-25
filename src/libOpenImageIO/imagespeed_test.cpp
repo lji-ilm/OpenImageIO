@@ -15,6 +15,7 @@
 #include <OpenImageIO/ustring.h>
 
 #include <functional>
+#include <filesystem>
 #include <iostream>
 #include <vector>
 
@@ -27,12 +28,14 @@ static int numthreads    = 0;
 static int autotile_size = 64;
 static bool iter_only    = false;
 static bool run_iter     = false;
+static bool run_imageBuf = false;
 static std::string conversionname;
 static TypeDesc conversion = TypeDesc::UNKNOWN;  // native by default
 static std::vector<ustring> input_filename;
 static std::string output_filename;
 static std::string output_format;
 static std::vector<char> buffer;
+static std::vector<char> raw_buffer;
 static ImageSpec bufspec, outspec;
 static std::shared_ptr<ImageCache> imagecache;
 static imagesize_t total_image_pixels = 0;
@@ -63,6 +66,8 @@ getargs(int argc, char* argv[])
       .help(Strutil::fmt::format("Autotile size (when used; default: {})", autotile_size));
     ap.arg("--iteronly", &iter_only)
       .help("Run ImageBuf iteration tests only (not read tests)");
+    ap.arg("--run_imageBuf", &run_imageBuf)
+      .help("Run ImageBuf Read/Write tests");
     ap.arg("--run_iter", &run_iter)
       .help("Run ImageBuf iteration tests");
     ap.arg("--convert %s", &conversionname)
@@ -192,7 +197,7 @@ time_read_one_tile_at_a_time()
         if (spec.tile_width == 0)
         {
             std::cout << " read_one_tile_at_a_time cannot be applied to scanline image:"<< filename << std::endl;
-            return;
+            continue;
         }
         // Refer to OIIO API documentation of tiled input
         int tilesize = spec.tile_width * spec.tile_height * pixelsize;
@@ -230,7 +235,7 @@ time_read_tile_row_at_a_time()
         if (spec.tile_width == 0)
         {
             std::cout << " read_one_tile_row_at_a_time cannot be applied to scanline image:" << filename << std::endl;
-            return;
+            continue;
         }
         // Refer to OIIO API documentation of tiled input
         int tile_row_size = spec.width * spec.tile_height * pixelsize;
@@ -265,7 +270,7 @@ time_read_tile_column_at_a_time()
         if (spec.tile_width == 0)
         {
             std::cout << " read_one_tile_column_at_a_time cannot be applied to scanline image: " << filename << std::endl;
-            return;
+            continue;
         }
         // Refer to OIIO API documentation of tiled input
         int tile_column_size = spec.tile_width * spec.height * pixelsize;
@@ -297,7 +302,7 @@ time_read_tile_column_at_a_time()
 static void
 time_read_tile_range()
 {
-        for (ustring filename : input_filename) {
+    for (ustring filename : input_filename) {
         auto in = ImageInput::open(filename.c_str());
         OIIO_ASSERT(in);
         const ImageSpec& spec(in->spec());
@@ -307,7 +312,7 @@ time_read_tile_range()
         if (spec.tile_width == 0)
         {
             std::cout << " read_tile_range cannot be applied to scanline image: " << filename << std::endl;
-            return;
+            continue;
         }
         int xbegin = (int)(spec.width * 0.2);
         int xend = (int)(spec.width * 0.8);
@@ -317,7 +322,7 @@ time_read_tile_range()
 
         if ((xend > xbegin) && (yend > ybegin))
         {
-            std::cout << " parameters for read_tiles: x:" << xbegin << ", " << xend << " y:" << ybegin << ", " << yend << std::endl;
+            // std::cout << " parameters for read_tiles: x:" << xbegin << ", " << xend << " y:" << ybegin << ", " << yend << std::endl;
             in->read_tiles(0, 0, // subimage, miplevel
                             xbegin, xend,
                             ybegin, yend,
@@ -331,6 +336,27 @@ time_read_tile_range()
             std::cout << " image is too small to carry out read tile range: " << filename << std::endl;
         };
         in->close();
+    }
+}
+
+
+
+static void
+time_raw_read_IO()
+{
+    for (ustring filename : input_filename) {
+        std::ifstream file(std::string(filename), std::ifstream::binary);
+        if (file)
+        {
+            file.seekg(0, file.end);
+            int file_size = file.tellg();
+            file.seekg(0, file.beg);
+            file.read(raw_buffer.data(), file_size);
+            if (!file) {
+                std::cerr << "Error: Failed to read the file.\n";
+            };
+            file.close();
+        }
     }
 }
 
@@ -703,7 +729,11 @@ main(int argc, char** argv)
     bool all_tile           = true;
     total_image_pixels      = 0;
     imagesize_t maxpelchans = 0;
+    imagesize_t max_raw_size = 0;
     for (auto&& fn : input_filename) {
+        std::filesystem::path file_path = std::string(fn);
+        max_raw_size = std::max(max_raw_size, std::filesystem::file_size(file_path));
+
         ImageSpec spec;
         if (!imagecache->get_imagespec(fn, spec)) {
             std::cout << "File \"" << fn << "\" could not be opened.\n";
@@ -721,6 +751,7 @@ main(int argc, char** argv)
         std::cout << "Please provide only scanline or tiled image in a single run. " << std::endl;
         return 0;
     }
+
     imagecache->invalidate_all(true);  // Don't hold anything
     std::cout << "Trails: " << ntrials << std::endl;
     if (!iter_only) {
@@ -732,8 +763,11 @@ main(int argc, char** argv)
             std::cout << "    ImageInput reads will convert data to "
                       << conversion << "\n";
         buffer.resize(maxpelchans * sizeof(float), 0);
+        raw_buffer.resize(max_raw_size);
 
-        std::cout << "Test Name                                     ,    AVERAGE TIME,    MIN TIME,    MAX TIME,    STDDEV,    Mpel/s" << "\n";
+        std::cout << "Test Name                                     ,    AVERAGE TIME,    MIN TIME,    MAX TIME,    STDDEV" << "\n";
+        test_read("baseline raw IO                              ",
+                  time_raw_read_IO, 0, 0);
         test_read("read_image                                   ",
                   time_read_image, 0, 0);
         if (all_scanline) {
@@ -755,19 +789,22 @@ main(int argc, char** argv)
             test_read("read_tile_range                               ",
                       time_read_tile_range, 0, 0);
         }
-        test_read("ImageBuf read                                ",
-                  time_read_imagebuf, 0, 0);
-        test_read("ImageCache get_pixels                        ",
-                  time_ic_get_pixels, 0, 0);
-        test_read("ImageBuf read (autotile)                     ",
-                  time_read_imagebuf, autotile_size, 0);
-        test_read("ImageCache get_pixels (autotile)             ",
-                  time_ic_get_pixels, autotile_size, 0);
-        if (all_scanline) {  // don't bother for tiled images
-            test_read("ImageBuf read (autotile+autoscanline)        ",
-                      time_read_imagebuf, autotile_size, 1);
-            test_read("ImageCache get_pixels (autotile+autoscanline)",
-                      time_ic_get_pixels, autotile_size, 1);
+        if (run_imageBuf)
+        {
+            test_read("ImageBuf read                                ",
+                    time_read_imagebuf, 0, 0);
+            test_read("ImageCache get_pixels                        ",
+                    time_ic_get_pixels, 0, 0);
+            test_read("ImageBuf read (autotile)                     ",
+                    time_read_imagebuf, autotile_size, 0);
+            test_read("ImageCache get_pixels (autotile)             ",
+                    time_ic_get_pixels, autotile_size, 0);
+            if (all_scanline) {  // don't bother for tiled images
+                test_read("ImageBuf read (autotile+autoscanline)        ",
+                        time_read_imagebuf, autotile_size, 1);
+                test_read("ImageCache get_pixels (autotile+autoscanline)",
+                        time_ic_get_pixels, autotile_size, 1);
+            }
         }
         if (verbose)
             std::cout << "\n" << imagecache->getstats(2) << "\n";
@@ -809,11 +846,13 @@ main(int argc, char** argv)
             test_write("write_tiles (a whole row at a time)          ",
                        time_write_tiles_row_at_a_time, 64);
         }
+        if (run_imageBuf) {
         test_write("ImageBuf::write (scanline)                   ",
                    time_write_imagebuf, 0);
         if (supports_tiles)
             test_write("ImageBuf::write (tiled)                      ",
                        time_write_imagebuf, 64);
+        }
         std::cout << std::endl;
     }
 
