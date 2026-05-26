@@ -323,7 +323,7 @@ time_read_tile_range()
 
         if ((xend > xbegin) && (yend > ybegin))
         {
-            std::cout << " parameters for read_tiles: x:" << xbegin << ", " << xend << " y:" << ybegin << ", " << yend << std::endl;
+            // std::cout << " parameters for read_tiles: x:" << xbegin << ", " << xend << " y:" << ybegin << ", " << yend << std::endl;
             in->read_tiles(0, 0, // subimage, miplevel
                             xbegin, xend,
                             ybegin, yend,
@@ -776,7 +776,7 @@ main(int argc, char** argv)
                       time_read_scanline_at_a_time, 0, 0);
             test_read("read_scanlines (64 at a time)                ",
                       time_read_64_scanlines_at_a_time, 0, 0);
-            test_read("read_scanline_range (center 60%)             ",
+            test_read("read_scanline_range (center 50%)             ",
                       time_read_scanline_range, 0, 0);
         }
 
@@ -787,7 +787,7 @@ main(int argc, char** argv)
                       time_read_tile_row_at_a_time, 0, 0);
             test_read("read_tile_column_at_a_time                    ",
                       time_read_tile_column_at_a_time, 0, 0);
-            test_read("read_tile_range                               ",
+            test_read("read_tile_range (center 50% pixels)           ",
                       time_read_tile_range, 0, 0);
         }
         if (run_imageBuf)
