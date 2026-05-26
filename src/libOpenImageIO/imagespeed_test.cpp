@@ -145,8 +145,8 @@ time_read_64_scanlines_at_a_time()
 
 
 
-// Read the center 60% of scanline ranges
-// Starting from floor(max_Y * 0.2) to floor(max_Y * 0.8)
+// Read the center 50% of scanline ranges
+// Starting from floor(max_Y * 0.25) to floor(max_Y * 0.75)
 // This range is perscribed and is not adjusted through the experiments -- see paper
 static void
 time_read_scanline_range()
@@ -159,8 +159,8 @@ time_read_scanline_range()
         if (!pixelsize)
             pixelsize = spec.pixel_bytes(true);  // UNKNOWN -> native
         imagesize_t scanlinesize = spec.width * pixelsize;
-        int ybegin = (int)(spec.height * 0.2);
-        int yend = (int)(spec.height * 0.8);
+        int ybegin = (int)(spec.height * 0.25);
+        int yend = (int)(spec.height * 0.75);
         if (yend > ybegin){
             //std::cout << " scanline_range: ybegin: " << ybegin << " yend: " << yend << std::endl;
             in->read_scanlines(0, // subimage
@@ -296,7 +296,8 @@ time_read_tile_column_at_a_time()
 
 
 
-// Read the center 60% (both X and Y) of the image via calling read_tiles
+// Read the center 50% pixels of the image via calling read_tiles
+// On both X and Y directions, starting at 0.1464 or (1 - (1 / sqrt(2))) / 2 to 0.8536
 // The range is perscribed and not to be changed, see paper
 // Let read_tile figure out how many tiles are required
 static void
@@ -314,15 +315,15 @@ time_read_tile_range()
             std::cout << " read_tile_range cannot be applied to scanline image: " << filename << std::endl;
             continue;
         }
-        int xbegin = (int)(spec.width * 0.2);
-        int xend = (int)(spec.width * 0.8);
+        int xbegin = (int)(spec.width * 0.1464);
+        int xend = (int)(spec.width * 0.8536);
 
-        int ybegin = (int)(spec.height * 0.2);
-        int yend = (int)(spec.height * 0.8);
+        int ybegin = (int)(spec.height * 0.1464);
+        int yend = (int)(spec.height * 0.8536);
 
         if ((xend > xbegin) && (yend > ybegin))
         {
-            // std::cout << " parameters for read_tiles: x:" << xbegin << ", " << xend << " y:" << ybegin << ", " << yend << std::endl;
+            std::cout << " parameters for read_tiles: x:" << xbegin << ", " << xend << " y:" << ybegin << ", " << yend << std::endl;
             in->read_tiles(0, 0, // subimage, miplevel
                             xbegin, xend,
                             ybegin, yend,
