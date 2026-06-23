@@ -116,12 +116,12 @@ public:
     /// pixel index.
     int capacity(int64_t pixel) const;
 
-    /// Insert `n` samples of the specified pixel, betinning at the sample
+    /// Insert `n` samples of the specified pixel, beginning at the sample
     /// position index. After insertion, the new samples will have
     /// uninitialized values.
     void insert_samples(int64_t pixel, int samplepos, int n = 1);
 
-    /// Erase `n` samples of the specified pixel, betinning at the sample
+    /// Erase `n` samples of the specified pixel, beginning at the sample
     /// position index.
     void erase_samples(int64_t pixel, int samplepos, int n = 1);
 
@@ -188,7 +188,13 @@ public:
     /// Merge the samples of `src`'s pixel into this `DeepData`'s pixel.
     /// Return `true` if ok, `false` if the operation could not be
     /// performed.
+    void merge_deep_pixels(int64_t pixel, const DeepData& src,
+                           int64_t srcpixel);
+
+#ifdef OIIO_INTERNAL
+    // DEPRECATED(3.2): use the version with int64_t
     void merge_deep_pixels(int64_t pixel, const DeepData& src, int srcpixel);
+#endif
 
     /// Return the z depth at which the pixel reaches full opacity.
     float opaque_z(int64_t pixel) const;

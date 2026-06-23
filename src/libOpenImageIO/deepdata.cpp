@@ -971,7 +971,7 @@ DeepData::split(int64_t pixel, float depth)
         float zb = deep_value(pixel, zbackchan, s);  // z back
         if (zf < depth && zb > depth) {
             // The sample spans depth, so split it.
-            // See http://www.openexr.com/InterpretingDeepPixels.pdf
+            // See https://openexr.com/en/latest/InterpretingDeepPixels.html
             splits_occurred = true;
             insert_samples(pixel, s + 1);
             copy_deep_sample(pixel, s + 1, *this, pixel, s);
@@ -1033,7 +1033,8 @@ namespace {
 // Comparator functor for depth sorting sample indices of a deep pixel.
 class SampleComparator {
 public:
-    SampleComparator(const DeepData& dd, int pixel, int zchan, int zbackchan)
+    SampleComparator(const DeepData& dd, int64_t pixel, int zchan,
+                     int zbackchan)
         : deepdata(dd)
         , pixel(pixel)
         , zchan(zchan)
@@ -1057,7 +1058,7 @@ public:
 
 private:
     const DeepData& deepdata;
-    int pixel;
+    int64_t pixel;
     int zchan, zbackchan;
 };
 
@@ -1071,7 +1072,7 @@ DeepData::sort(int64_t pixel)
     int zchan = m_impl->m_z_channel;
     if (zchan < 0)
         return;  // No channel labeled Z -- we don't know what to do
-    int zbackchan = m_impl->m_z_channel;
+    int zbackchan = m_impl->m_zback_channel;
     if (zbackchan < 0)
         zbackchan = zchan;
     int nsamples = samples(pixel);
@@ -1114,21 +1115,16 @@ DeepData::merge_overlaps(int64_t pixel)
         if (zf == deep_value(pixel, zchan, s - 1)
             && zb == deep_value(pixel, zbackchan, s - 1)) {
             // The samples overlap exactly, merge them per
-            // See http://www.openexr.com/InterpretingDeepPixels.pdf
+            // See https://openexr.com/en/latest/InterpretingDeepPixels.html
             for (int c = 0; c < nchans; ++c) {  // set the colors
                 int alphachan = m_impl->m_myalphachannel[c];
                 if (alphachan < 0)
                     continue;  // Not color or alpha
                 if (alphachan == c)
                     continue;  // Adjust the alphas in a second pass below
-                float a1 = (alphachan < 0)
-                               ? 1.0f
-                               : clamp(deep_value(pixel, alphachan, s - 1),
-                                       0.0f, 1.0f);
-                float a2 = (alphachan < 0)
-                               ? 1.0f
-                               : clamp(deep_value(pixel, alphachan, s), 0.0f,
-                                       1.0f);
+                float a1 = clamp(deep_value(pixel, alphachan, s - 1), 0.0f,
+                                 1.0f);
+                float a2 = clamp(deep_value(pixel, alphachan, s), 0.0f, 1.0f);
                 float c1 = deep_value(pixel, c, s - 1);
                 float c2 = deep_value(pixel, c, s);
                 float am = a1 + a2 - a1 * a2;
@@ -1155,14 +1151,9 @@ DeepData::merge_overlaps(int64_t pixel)
                 int alphachan = m_impl->m_myalphachannel[c];
                 if (alphachan != c)
                     continue;  // This pass is only for alphas
-                float a1 = (alphachan < 0)
-                               ? 1.0f
-                               : clamp(deep_value(pixel, alphachan, s - 1),
-                                       0.0f, 1.0f);
-                float a2 = (alphachan < 0)
-                               ? 1.0f
-                               : clamp(deep_value(pixel, alphachan, s), 0.0f,
-                                       1.0f);
+                float a1 = clamp(deep_value(pixel, alphachan, s - 1), 0.0f,
+                                 1.0f);
+                float a2 = clamp(deep_value(pixel, alphachan, s), 0.0f, 1.0f);
                 float am = a1 + a2 - a1 * a2;
                 set_deep_value(pixel, c, s - 1, am);  // setting alpha
             }
@@ -1176,7 +1167,8 @@ DeepData::merge_overlaps(int64_t pixel)
 
 
 void
-DeepData::merge_deep_pixels(int64_t pixel, const DeepData& src, int srcpixel)
+DeepData::merge_deep_pixels(int64_t pixel, const DeepData& src,
+                            int64_t srcpixel)
 {
     int srcsamples = src.samples(srcpixel);
     if (srcsamples == 0)
@@ -1210,6 +1202,15 @@ DeepData::merge_deep_pixels(int64_t pixel, const DeepData& src, int srcpixel)
 
     // Now merge the overlaps
     merge_overlaps(pixel);
+}
+
+
+
+// DEPRECATED(3.2): use the version with int64_t
+void
+DeepData::merge_deep_pixels(int64_t pixel, const DeepData& src, int srcpixel)
+{
+    merge_deep_pixels(pixel, src, int64_t(srcpixel));
 }
 
 

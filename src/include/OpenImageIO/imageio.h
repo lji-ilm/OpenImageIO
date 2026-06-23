@@ -456,7 +456,7 @@ public:
     /// whole image.  If this returns false, the image is much too big
     /// to allocate and read all at once, so client apps beware and check
     /// these routines for overflows!
-    bool size_t_safe() const noexcept {
+    OIIO_NODISCARD bool size_t_safe() const noexcept {
         const imagesize_t big = std::numeric_limits<size_t>::max();
         return image_bytes() < big && scanline_bytes() < big &&
             tile_bytes() < big;
@@ -775,7 +775,7 @@ public:
     /// Helper function to verify that the given pixel range exactly covers a
     /// set of 2D tiles.  Also returns false if the spec indicates that the
     /// image isn't tiled at all.
-    bool valid_tile_range (int xbegin, int xend, int ybegin, int yend) noexcept {
+    OIIO_NODISCARD bool valid_tile_range (int xbegin, int xend, int ybegin, int yend) noexcept {
         return (tile_width &&
                 ((xbegin-x) % tile_width)  == 0 &&
                 ((ybegin-y) % tile_height) == 0 &&
@@ -786,7 +786,7 @@ public:
     /// Helper function to verify that the given pixel range exactly covers a
     /// set of 3D tiles.  Also returns false if the spec indicates that the
     /// image isn't tiled at all.
-    bool valid_tile_range (int xbegin, int xend, int ybegin, int yend,
+    OIIO_NODISCARD bool valid_tile_range (int xbegin, int xend, int ybegin, int yend,
                            int zbegin, int zend) noexcept {
         return (tile_width &&
                 ((xbegin-x) % tile_width)  == 0 &&
@@ -3967,6 +3967,16 @@ OIIO_API std::string geterror(bool clear = true);
 ///   further decode anything in the file. This may be a better choice to
 ///   enable globally in an environment where security is a higher priority
 ///   than being tolerant of partially broken image files.
+///
+/// - `ustring:cleanup` (int: 0)
+///
+///    If nonzero, upon exit, do a thorough (and possibly expensive) teardown
+///    of ustring internal resources to ensure that there are no apparent
+///    memory leaks. This is only desirable in certain debugging situations.
+///    Ordinarily, it is better to finish as quickly as possible, so the
+///    default of 0 skips a time consuming and pointless teardown of the
+///    ustring internal allocations when the app exits. Note that this can
+///    also be enabled with the `OIIO_USTRING_CLEANUP` environment variable.
 ///
 /// EXAMPLES:
 /// ```
