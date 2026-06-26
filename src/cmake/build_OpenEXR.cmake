@@ -3,10 +3,10 @@
 # https://github.com/AcademySoftwareFoundation/OpenImageIO
 
 
-set_cache (OpenEXR_BUILD_VERSION 3.3.5 "OpenEXR version for local builds")
+set_cache (OpenEXR_BUILD_VERSION 3.4.13 "OpenEXR version for local builds")
 set (OpenEXR_GIT_REPOSITORY "https://github.com/AcademySoftwareFoundation/OpenEXR")
 set (OpenEXR_GIT_TAG "v${OpenEXR_BUILD_VERSION}")
-set (OpenEXR_GIT_COMMIT "6661cb40c6fa8d332f142e660e25ac96675c15bd")
+set (OpenEXR_GIT_COMMIT "c1194b2cb23a1bdf76fe5e756b22e8436b9a98c9")
 set_cache (OpenEXR_BUILD_SHARED_LIBS ${LOCAL_BUILD_SHARED_LIBS_DEFAULT}
            DOC "Should a local OpenEXR build, if necessary, build shared libraries" ADVANCED)
 
