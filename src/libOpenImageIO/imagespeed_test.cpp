@@ -24,7 +24,7 @@ using namespace OIIO;
 static bool verbose      = false;
 static int iterations    = 1;
 static int ntrials       = 5;
-static int numthreads    = 0;
+static int numthreads    = 1;
 static int autotile_size = 64;
 static bool iter_only    = false;
 static bool run_iter     = false;
