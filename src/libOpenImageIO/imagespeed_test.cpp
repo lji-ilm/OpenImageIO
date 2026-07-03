@@ -91,8 +91,9 @@ time_read_image()
     for (ustring filename : input_filename) {
         auto in = ImageInput::open(filename.c_str());
         OIIO_ASSERT(in);
-        (void)in->read_image(0, 0, 0, in->spec().nchannels, conversion,
-                             &buffer[0]);
+        bool succ = in->read_image(0, 0, 0, in->spec().nchannels, conversion,
+                                    &buffer[0]);
+        OIIO_ASSERT(succ);
         in->close();
     }
 }
@@ -111,8 +112,9 @@ time_read_scanline_at_a_time()
             pixelsize = spec.pixel_bytes(true);  // UNKNOWN -> native
         imagesize_t scanlinesize = spec.width * pixelsize;
         for (int y = 0; y < spec.height; ++y) {
-            in->read_scanline(y + spec.y, 0, conversion,
-                              &buffer[scanlinesize * y]);
+            bool succ = in->read_scanline(y + spec.y, 0, conversion,
+                                            &buffer[scanlinesize * y]);
+            OIIO_ASSERT(succ);
         }
         in->close();
     }
@@ -132,11 +134,11 @@ time_read_64_scanlines_at_a_time()
             pixelsize = spec.pixel_bytes(true);  // UNKNOWN -> native
         imagesize_t scanlinesize = spec.width * pixelsize;
         for (int y = 0; y < spec.height; y += 64) {
-            bool ok = in->read_scanlines(
+            bool succ = in->read_scanlines(
                 /*subimage=*/0, /*miplevel=*/0, y + spec.y,
                 std::min(y + spec.y + 64, spec.y + spec.height), 0, 0,
                 spec.nchannels, conversion, &buffer[scanlinesize * y]);
-            OIIO_ASSERT(ok);
+            OIIO_ASSERT(succ);
         }
         in->close();
     }
@@ -163,7 +165,7 @@ time_read_scanline_range()
         int yend = (int)(spec.height * 0.75);
         if (yend > ybegin){
             //std::cout << " scanline_range: ybegin: " << ybegin << " yend: " << yend << std::endl;
-            in->read_scanlines(0, // subimage
+            bool succ = in->read_scanlines(0, // subimage
                             0, // miplevel
                             ybegin, // y begin
                             yend, // y end
@@ -172,6 +174,7 @@ time_read_scanline_range()
                             spec.nchannels, //ch end
                             conversion,
                             &buffer[scanlinesize * ybegin]);
+            OIIO_ASSERT(succ);
             }
         else
         {
@@ -277,7 +280,7 @@ time_read_tile_column_at_a_time()
         int ntilecolumn = 0;
         for (int x = spec.x; x < spec.x + spec.width; x += spec.tile_width)
         {
-            in->read_tiles(0, 0, // subimage, miplevel
+            bool succ = in->read_tiles(0, 0, // subimage, miplevel
                         x, std::min(x + spec.tile_width, spec.width),
                         0, spec.height,
                         0, 1, //z
@@ -288,6 +291,7 @@ time_read_tile_column_at_a_time()
                         // Column reads are typically traspose of the native data format, and the tile being read could also 
                         // still be row-major inside the individual tile read.
                         // However, we're only timing reading performance and not making use of the read-in data.
+            OIIO_ASSERT(succ);
             ntilecolumn += 1;
         }
         in->close();
@@ -324,13 +328,14 @@ time_read_tile_range()
         if ((xend > xbegin) && (yend > ybegin))
         {
             // std::cout << " parameters for read_tiles: x:" << xbegin << ", " << xend << " y:" << ybegin << ", " << yend << std::endl;
-            in->read_tiles(0, 0, // subimage, miplevel
+            bool succ = in->read_tiles(0, 0, // subimage, miplevel
                             xbegin, xend,
                             ybegin, yend,
                             0, 1, //z
                             0, spec.nchannels, //channels
                             conversion, //pixelformat
                             &buffer[(ybegin * spec.width + xbegin) * pixelsize]);
+            OIIO_ASSERT(succ);
         }
         else
         {
@@ -340,26 +345,6 @@ time_read_tile_range()
     }
 }
 
-
-
-static void
-time_raw_read_IO()
-{
-    for (ustring filename : input_filename) {
-        std::ifstream file(std::string(filename), std::ifstream::binary);
-        if (file)
-        {
-            file.seekg(0, file.end);
-            int file_size = file.tellg();
-            file.seekg(0, file.beg);
-            file.read(raw_buffer.data(), file_size);
-            if (!file) {
-                std::cerr << "Error: Failed to read the file.\n";
-            };
-            file.close();
-        }
-    }
-}
 
 
 
@@ -746,6 +731,13 @@ main(int argc, char** argv)
         return 0;
     }
 
+    if (all_scanline){
+        std::cout << "All input images are scanline. Running scanline tests.\n";
+    }
+    else if (all_tile){
+        std::cout << "All input images are tiled. Running tile tests.\n";
+    }
+
     imagecache->invalidate_all(true);  // Don't hold anything
     std::cout << "Trails: " << ntrials << std::endl;
     if (!iter_only) {
@@ -760,8 +752,6 @@ main(int argc, char** argv)
         raw_buffer.resize(max_raw_size);
 
         std::cout << "Test Name                                     ,    AVERAGE TIME,    MIN TIME,    MAX TIME,    STDDEV" << "\n";
-        test_read("baseline raw IO                              ",
-                  time_raw_read_IO, 0, 0);
         test_read("read_image                                   ",
                   time_read_image, 0, 0);
         if (all_scanline) {
