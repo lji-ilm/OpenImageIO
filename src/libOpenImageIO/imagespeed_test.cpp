@@ -247,7 +247,7 @@ time_read_tile_row_at_a_time()
         {
             in->read_tiles(0, 0, // subimage, miplevel
                         0, spec.width,
-                        y, std::min(y + spec.tile_height, spec.height),
+                        y, std::min(y + spec.tile_height, spec.y + spec.height),
                         0, 1, //z
                         0, spec.nchannels, //channels
                         conversion, //pixelformat
@@ -281,7 +281,7 @@ time_read_tile_column_at_a_time()
         for (int x = spec.x; x < spec.x + spec.width; x += spec.tile_width)
         {
             bool succ = in->read_tiles(0, 0, // subimage, miplevel
-                        x, std::min(x + spec.tile_width, spec.width),
+                        x, std::min(x + spec.tile_width, spec.x + spec.width),
                         0, spec.height,
                         0, 1, //z
                         0, spec.nchannels, //channels
