@@ -327,10 +327,22 @@ time_read_tile_range()
 
         if ((xend > xbegin) && (yend > ybegin))
         {
+            // Find the boundary of the tiles that cover the requested range and can be passed into read_tiles.
+            // The read_tiles function only accepts tile boundaries or image boundaries.
+            // C++'s int division is floor division (rounding down), so we can use it to find the tile boundaries.
+
+            int x_tile_begin = ((xbegin - spec.x) / spec.tile_width) * spec.tile_width + spec.x;
+            int y_tile_begin = ((ybegin - spec.y) / spec.tile_height) * spec.tile_height + spec.y;
+            int x_tile_end = ((xend - spec.x) / spec.tile_width + 1) * spec.tile_width + spec.x;
+            if (x_tile_end > (spec.width + spec.x))
+                x_tile_end = spec.width + spec.x;
+            int y_tile_end = ((yend - spec.y) / spec.tile_height + 1) * spec.tile_height + spec.y;
+            if (y_tile_end > (spec.height + spec.y))
+                y_tile_end = spec.height + spec.y;
             // std::cout << " parameters for read_tiles: x:" << xbegin << ", " << xend << " y:" << ybegin << ", " << yend << std::endl;
             bool succ = in->read_tiles(0, 0, // subimage, miplevel
-                            xbegin, xend,
-                            ybegin, yend,
+                            x_tile_begin, x_tile_end,
+                            y_tile_begin, y_tile_end,
                             0, 1, //z
                             0, spec.nchannels, //channels
                             conversion, //pixelformat
