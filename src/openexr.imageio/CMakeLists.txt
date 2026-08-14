@@ -4,7 +4,7 @@
 
 set (openexr_src exrinput.cpp exroutput.cpp)
 
-option (OIIO_USE_EXR_C_API "Allow use of the new exr 3.1 C API if available" ON)
+option (OIIO_USE_EXR_C_API "Allow use of the new exr 3.1 C API if available" OFF)
 if (OIIO_USE_EXR_C_API AND TARGET OpenEXR::OpenEXRCore)
     set (openexr_defs OIIO_USE_EXR_C_API=1)
     list (APPEND openexr_src exrinput_c.cpp)
