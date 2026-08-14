@@ -48,7 +48,7 @@ getargs(int argc, char* argv[])
 {
     ArgParse ap;
     // clang-format off
-    ap.intro("imagespeed_test\n" OIIO_INTRO_STRING)
+    ap.intro("imagespeed_test -- version for EXR benchmark paper\n" OIIO_INTRO_STRING)
       .usage("imagespeed_test [options]");
 
     ap.arg("filename")
