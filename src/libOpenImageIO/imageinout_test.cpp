@@ -6,6 +6,7 @@
 // Tests related to ImageInput and ImageOutput
 /////////////////////////////////////////////////////////////////////////
 
+#include <cstring>
 #include <iostream>
 
 #if defined(__linux__)
@@ -680,6 +681,192 @@ benchmark_tile_sizes(string_view extension, TypeDesc datatype,
 
 
 
+// Verify that reading an OpenEXR scanline file in small pieces produces
+// bit-identical pixels to reading it all at once.
+//
+// This is a regression test for the decoded-chunk cache in the OpenEXR core
+// reader. EXR compression bundles multiple scanlines into a single chunk that
+// must be decompressed as a unit (1 line for none/rle/zips, 16 for zip/pxr24,
+// 32 for piz/dwaa, 256 for dwab), and the reader caches the decompressed chunk
+// so that a caller reading one scanline at a time doesn't decompress the same
+// chunk once per line. Mistakes in the cache bookkeeping show up as wrong or
+// misplaced pixels: at unaligned start rows, in the short final chunk, or when
+// the requested channel range changes between reads against one open file.
+static void
+test_exr_scanline_chunk_cache()
+{
+    if (!onlyformat.empty() && onlyformat != "exr")
+        return;
+    Strutil::print("\nTesting EXR scanline chunk cache\n");
+    if (!ImageOutput::create("exr")) {
+        Strutil::print("  no EXR support, skipping\n");
+        return;
+    }
+
+    // Height is deliberately not a multiple of any chunk size, so the last
+    // chunk of every file is partial, and is > 256 so that even dwab spans
+    // more than one chunk.
+    const int width  = 41;
+    const int height = 300;
+    const int nchans = 4;
+
+    for (string_view compression :
+         { "none", "zips", "rle", "zip", "piz", "pxr24", "dwaa", "dwab" }) {
+        // yorigin 5 puts the data window on a non-zero, non-chunk-aligned
+        // origin, which is what exercises the chunk-alignment arithmetic.
+        for (int yorigin : { 0, 5 }) {
+            std::string filename
+                = Strutil::fmt::format("chunkcache-{}-{}.exr", compression,
+                                       yorigin);
+
+            // Values encode their own coordinates, so a scanline landing at the
+            // wrong offset is unmistakable rather than plausible.
+            ImageSpec spec(width, height, nchans, TypeFloat);
+            spec.y      = yorigin;
+            spec.full_y = yorigin;
+            spec.attribute("compression", compression);
+            ImageBuf ref(spec);
+            for (ImageBuf::Iterator<float> p(ref); !p.done(); ++p) {
+                p[0] = float(p.x() % 61) / 61.0f;
+                p[1] = float(p.y() % 67) / 67.0f;
+                p[2] = float((p.x() + p.y()) % 71) / 71.0f;
+                p[3] = float((p.x() * 3 + p.y() * 7) % 73) / 73.0f;
+            }
+            if (!ref.write(filename, TypeHalf)) {
+                Strutil::print("  could not write {}: {}\n", filename,
+                               ref.geterror());
+                OIIO_CHECK_ASSERT(false && "failed to write EXR test file");
+                continue;
+            }
+
+            auto in = ImageInput::open(filename);
+            OIIO_CHECK_ASSERT(in && "could not open the EXR we just wrote");
+            if (!in)
+                continue;
+            ImageSpec rspec = in->spec_dimensions(0);
+            OIIO_CHECK_EQUAL(rspec.width, width);
+            OIIO_CHECK_EQUAL(rspec.height, height);
+            OIIO_CHECK_EQUAL(rspec.y, yorigin);
+            // A tiled file would not exercise the scanline path at all.
+            OIIO_CHECK_EQUAL(rspec.tile_width, 0);
+
+            const size_t pixelbytes = rspec.pixel_bytes(true);
+            const size_t slbytes    = size_t(rspec.width) * pixelbytes;
+            std::vector<char> refbuf(slbytes * size_t(height), 0);
+            OIIO_CHECK_ASSERT(
+                in->read_image(0, 0, 0, nchans, TypeHalf, refbuf.data()));
+
+            // Compare a buffer read some other way against the whole-image
+            // read, reporting the first differing scanline so that a failure
+            // is diagnosable rather than just a boolean.
+            auto check = [&](string_view what, const std::vector<char>& got) {
+                bool same = (got == refbuf);
+                if (!same) {
+                    int badline = -1;
+                    for (int y = 0; y < height && badline < 0; ++y)
+                        if (std::memcmp(&got[size_t(y) * slbytes],
+                                        &refbuf[size_t(y) * slbytes], slbytes)
+                            != 0)
+                            badline = y;
+                    Strutil::print(
+                        "  MISMATCH compression={} yorigin={} [{}]: first bad scanline {}\n",
+                        compression, yorigin, what, badline);
+                }
+                OIIO_CHECK_ASSERT(same);
+            };
+
+            // One scanline at a time, ascending. This is the case the cache
+            // exists for.
+            {
+                std::vector<char> got(refbuf.size(), 0);
+                bool ok = true;
+                for (int y = 0; y < height; ++y)
+                    ok &= in->read_scanlines(0, 0, yorigin + y, yorigin + y + 1,
+                                             0, 0, nchans, TypeHalf,
+                                             &got[size_t(y) * slbytes]);
+                OIIO_CHECK_ASSERT(ok);
+                check("1 at a time ascending", got);
+            }
+
+            // Descending, to defeat any accidental assumption that reads only
+            // ever move forward.
+            {
+                std::vector<char> got(refbuf.size(), 0);
+                bool ok = true;
+                for (int y = height - 1; y >= 0; --y)
+                    ok &= in->read_scanlines(0, 0, yorigin + y, yorigin + y + 1,
+                                             0, 0, nchans, TypeHalf,
+                                             &got[size_t(y) * slbytes]);
+                OIIO_CHECK_ASSERT(ok);
+                check("1 at a time descending", got);
+            }
+
+            // Batches that align with no chunk size, so nearly every request
+            // starts and ends partway through a chunk.
+            for (int batch : { 3, 7, 37, 64 }) {
+                std::vector<char> got(refbuf.size(), 0);
+                bool ok = true;
+                for (int y = 0; y < height; y += batch) {
+                    int y1 = std::min(y + batch, height);
+                    ok &= in->read_scanlines(0, 0, yorigin + y, yorigin + y1, 0,
+                                             0, nchans, TypeHalf,
+                                             &got[size_t(y) * slbytes]);
+                }
+                OIIO_CHECK_ASSERT(ok);
+                check(Strutil::fmt::format("{} at a time", batch), got);
+            }
+
+            // Channel subsets interleaved with full-channel reads on the same
+            // open file. This is what catches a reused decode pipeline that
+            // held on to stale channel pointers, or reused an unpack routine
+            // chosen for a different channel count.
+            {
+                const int cb = 1, ce = 3;
+                const size_t subpixelbytes = rspec.pixel_bytes(cb, ce, true);
+                const size_t subslbytes    = size_t(rspec.width)
+                                          * subpixelbytes;
+                const size_t choffset = rspec.pixel_bytes(0, cb, true);
+                std::vector<char> got(subslbytes * size_t(height), 0);
+                std::vector<char> full(refbuf.size(), 0);
+                bool ok = true;
+                for (int y = 0; y < height; ++y) {
+                    ok &= in->read_scanlines(0, 0, yorigin + y, yorigin + y + 1,
+                                             0, cb, ce, TypeHalf,
+                                             &got[size_t(y) * subslbytes]);
+                    ok &= in->read_scanlines(0, 0, yorigin + y, yorigin + y + 1,
+                                             0, 0, nchans, TypeHalf,
+                                             &full[size_t(y) * slbytes]);
+                }
+                OIIO_CHECK_ASSERT(ok);
+                check("full channels interleaved with subset", full);
+
+                bool same = true;
+                for (int y = 0; y < height && same; ++y)
+                    for (int x = 0; x < width && same; ++x) {
+                        const char* g = &got[size_t(y) * subslbytes
+                                             + size_t(x) * subpixelbytes];
+                        const char* r = &refbuf[size_t(y) * slbytes
+                                                + size_t(x) * pixelbytes
+                                                + choffset];
+                        same = (std::memcmp(g, r, subpixelbytes) == 0);
+                    }
+                if (!same)
+                    Strutil::print(
+                        "  MISMATCH compression={} yorigin={} [channel subset {}-{}]\n",
+                        compression, yorigin, cb, ce - 1);
+                OIIO_CHECK_ASSERT(same);
+            }
+
+            OIIO_CHECK_ASSERT(in->close());
+            in.reset();
+            if (!nodelete)
+                Filesystem::remove(filename);
+        }
+    }
+}
+
+
+
 int
 main(int argc, char* argv[])
 {
@@ -712,6 +899,7 @@ main(int argc, char* argv[])
     test_all_formats();
     test_thumbnail_attribs();
     test_read_tricky_sizes();
+    test_exr_scanline_chunk_cache();
     benchmark_tile_sizes("exr", TypeHalf, 4);
     benchmark_tile_sizes("tif", TypeUInt16, 16);
 

@@ -96,6 +96,213 @@ oiio_exr_read_func(exr_const_context_t ctxt, void* userdata, void* buffer,
     return nread;
 }
 
+// A reusable OpenEXR decode pipeline, together with a record of which chunk it
+// most recently decoded. Keeping one of these alive between calls buys us two
+// things:
+//
+//   1. The pipeline's internal packed/unpacked/scratch buffers are reused (via
+//      exr_decoding_update) rather than being allocated and freed for every
+//      chunk. Note that exr_decoding_initialize zeroes the whole pipeline
+//      struct without freeing anything, so it must be called exactly once per
+//      pipeline -- everything after that has to go through update.
+//
+//   2. If a later request lands in the chunk we already have decompressed, we
+//      can skip the read and decompress stages entirely and re-run only the
+//      unpack step. That is the whole point: a caller reading one scanline at
+//      a time from a file with many scanlines per chunk (16 for zip, 32 for
+//      dwaa/piz, 256 for dwab/htj2k256) would otherwise decompress the same
+//      chunk once per scanline.
+//
+// This mirrors ScanLineProcess in OpenEXR's own ImfScanLineInputFile.cpp.
+//
+// A ChunkDecoder is NOT thread safe -- exr_decode_pipeline_t is documented as
+// per-thread state, though any number of them may work concurrently against one
+// shared context. Exclusive ownership for the duration of a chunk is what
+// OpenEXRCoreInput's checkout/checkin pool provides.
+struct ChunkDecoder {
+    exr_decode_pipeline_t decoder = EXR_DECODE_PIPELINE_INITIALIZER;
+    exr_chunk_info_t cinfo {};
+    bool initialized      = false;  ///< Has the pipeline been initialized?
+    exr_result_t last_err = EXR_ERR_UNKNOWN;  ///< Result of the last decode
+
+    // Identity of the chunk currently sitting in the pipeline's buffers.
+    exr_const_context_t cached_context = nullptr;
+    int cached_subimage                = -1;
+    int32_t cached_chunk_idx           = -1;
+
+    // How the channel pointers are currently configured. The routine chosen by
+    // exr_decoding_choose_default_routines() depends on the channel count,
+    // types and strides, so a change to any of this means they must be
+    // re-chosen rather than reused.
+    int cfg_chbegin          = -1;
+    int cfg_chend            = -1;
+    size_t cfg_pixelbytes    = 0;
+    size_t cfg_scanlinebytes = 0;
+
+    ChunkDecoder()                               = default;
+    ChunkDecoder(const ChunkDecoder&)            = delete;
+    ChunkDecoder& operator=(const ChunkDecoder&) = delete;
+    ~ChunkDecoder() { reset(); }
+
+    // Tear the pipeline down. Must happen before the context it refers to is
+    // finished, and before any re-initialize for a different part.
+    void reset()
+    {
+        if (initialized) {
+            exr_decoding_destroy(decoder.context, &decoder);
+            exr_decode_pipeline_t nil = EXR_DECODE_PIPELINE_INITIALIZER;
+            decoder                   = nil;
+            initialized               = false;
+        }
+        last_err         = EXR_ERR_UNKNOWN;
+        cached_context   = nullptr;
+        cached_subimage  = -1;
+        cached_chunk_idx = -1;
+        cfg_chbegin = cfg_chend = -1;
+        cfg_pixelbytes = cfg_scanlinebytes = 0;
+    }
+
+    // Can a request for this chunk be satisfied by re-running only the unpack
+    // step, i.e. is the chunk already decompressed in our buffers and is the
+    // pipeline still configured the same way?
+    bool can_reuse(exr_const_context_t ctx, int subimage, int32_t chunkidx,
+                   int chbegin, int chend, size_t pixelbytes,
+                   size_t scanlinebytes) const
+    {
+        return initialized && last_err == EXR_ERR_SUCCESS
+               && cached_context == ctx && cached_subimage == subimage
+               && cached_chunk_idx == chunkidx && cfg_chbegin == chbegin
+               && cfg_chend == chend && cfg_pixelbytes == pixelbytes
+               && cfg_scanlinebytes == scanlinebytes
+               // Uncompressed data can be read straight into the caller's
+               // buffer, in which case there is no unpacked buffer to re-unpack
+               // from and no unpack routine at all. That only happens for
+               // compression types with one scanline per chunk, where there is
+               // nothing to be gained by reuse anyway.
+               && decoder.chunk.unpacked_size > 0
+               && decoder.unpack_and_convert_fn != nullptr;
+    }
+
+    // Point the pipeline's channel outputs at `dest` and tell it which lines of
+    // the chunk we actually want.
+    //
+    // Beware the asymmetry here, which is easy to get backwards: the unpack
+    // routines advance the *source* by user_line_begin_skip but leave the
+    // destination pointer alone. So `dest` is the address of the first line the
+    // caller wants, not the address the chunk's first line would occupy.
+    void aim(const ImageSpec& spec, int chbegin, int chend, uint8_t* dest,
+             int skip, int nlines, size_t pixelbytes, size_t scanlinebytes)
+    {
+        decoder.user_line_begin_skip = skip;
+        decoder.user_line_end_ignore
+            = std::max(0, int(decoder.chunk.height) - skip - nlines);
+
+        // Clear every channel before assigning. A reused pipeline still holds
+        // the decode_to_ptr values from its previous use, so if this request
+        // asks for a different set of channels, any left behind would have the
+        // unpacker writing through a stale pointer.
+        for (int dc = 0; dc < decoder.channel_count; ++dc) {
+            decoder.channels[dc].decode_to_ptr     = nullptr;
+            decoder.channels[dc].user_pixel_stride = 0;
+            decoder.channels[dc].user_line_stride  = 0;
+        }
+
+        size_t chanoffset = 0;
+        for (int c = chbegin; c < chend; ++c) {
+            size_t chanbytes  = spec.channelformat(c).size();
+            string_view cname = spec.channel_name(c);
+            for (int dc = 0; dc < decoder.channel_count; ++dc) {
+                exr_coding_channel_info_t& curchan = decoder.channels[dc];
+                if (cname == curchan.channel_name) {
+                    curchan.decode_to_ptr     = dest + chanoffset;
+                    curchan.user_pixel_stride = pixelbytes;
+                    curchan.user_line_stride  = scanlinebytes;
+                    chanoffset += chanbytes;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Full decode of `newchunk`: read, decompress, and unpack into `dest`.
+    exr_result_t decode(exr_const_context_t ctx, int subimage,
+                        const exr_chunk_info_t& newchunk,
+                        const ImageSpec& spec, int chbegin, int chend,
+                        uint8_t* dest, int skip, int nlines, size_t pixelbytes,
+                        size_t scanlinebytes)
+    {
+        // A pipeline is bound to the context and part it was initialized for;
+        // exr_decoding_update rejects any other. Start over if either changed.
+        if (initialized
+            && (cached_context != ctx || cached_subimage != subimage))
+            reset();
+
+        cinfo      = newchunk;
+        bool first = !initialized;
+        exr_result_t rv;
+        if (first) {
+            rv = exr_decoding_initialize(ctx, subimage, &cinfo, &decoder);
+            if (rv != EXR_ERR_SUCCESS) {
+                last_err = rv;
+                return rv;
+            }
+            initialized    = true;
+            cached_context = ctx;
+        } else {
+            rv = exr_decoding_update(ctx, subimage, &cinfo, &decoder);
+            if (rv != EXR_ERR_SUCCESS) {
+                last_err         = rv;
+                cached_chunk_idx = -1;
+                return rv;
+            }
+        }
+        cached_subimage = subimage;
+
+        aim(spec, chbegin, chend, dest, skip, nlines, pixelbytes,
+            scanlinebytes);
+
+        // The chosen routines depend on the channel configuration, so re-choose
+        // whenever it changes -- not just on first use. This is cheap: no I/O
+        // and no decompression, just function pointer selection.
+        if (first || chbegin != cfg_chbegin || chend != cfg_chend
+            || pixelbytes != cfg_pixelbytes
+            || scanlinebytes != cfg_scanlinebytes) {
+            rv = exr_decoding_choose_default_routines(ctx, subimage, &decoder);
+            if (rv != EXR_ERR_SUCCESS) {
+                last_err         = rv;
+                cached_chunk_idx = -1;
+                return rv;
+            }
+            cfg_chbegin       = chbegin;
+            cfg_chend         = chend;
+            cfg_pixelbytes    = pixelbytes;
+            cfg_scanlinebytes = scanlinebytes;
+        }
+
+        rv               = exr_decoding_run(ctx, subimage, &decoder);
+        last_err         = rv;
+        cached_chunk_idx = (rv == EXR_ERR_SUCCESS) ? cinfo.idx : -1;
+        return rv;
+    }
+
+    // Cache hit: the chunk is already decompressed in our buffers, so only the
+    // unpack step needs to run again against the new destination.
+    exr_result_t unpack_only(const ImageSpec& spec, int chbegin, int chend,
+                             uint8_t* dest, int skip, int nlines,
+                             size_t pixelbytes, size_t scanlinebytes)
+    {
+        aim(spec, chbegin, chend, dest, skip, nlines, pixelbytes,
+            scanlinebytes);
+        exr_result_t rv = decoder.unpack_and_convert_fn(&decoder);
+        last_err        = rv;
+        if (rv != EXR_ERR_SUCCESS)
+            cached_chunk_idx = -1;
+        return rv;
+    }
+};
+
+
+
 class OpenEXRCoreInput final : public ImageInput {
 public:
     OpenEXRCoreInput();
@@ -213,6 +420,15 @@ private:
     std::vector<float> m_missingcolor;  ///< Color for missing tile/scanline
     std::string m_filename;             // filename, if known
 
+    /// Pool of decode pipelines kept alive between calls, so that reads landing
+    /// in a chunk we already decoded don't have to decompress it again. Grown
+    /// lazily and bounded by decoder_pool_cap(), so a single-threaded reader
+    /// only ever holds one.
+    std::vector<std::unique_ptr<ChunkDecoder>> m_decoder_pool;
+    /// Guards m_decoder_pool only -- held just long enough to pop or push,
+    /// never across a decode.
+    spin_mutex m_decoder_pool_mutex;
+
     void init()
     {
         m_exr_context    = nullptr;
@@ -221,6 +437,61 @@ private:
         m_local_io.reset();
         m_missingcolor.clear();
         m_filename.clear();
+        // NB: m_decoder_pool is deliberately not touched here. The cached
+        // pipelines must be destroyed *before* the context they refer to, so
+        // close() clears the pool itself, ahead of exr_finish().
+    }
+
+    /// How many decoders to keep alive. Each holds buffers on the order of one
+    /// uncompressed chunk (8 MB for a 4K RGBA half file at 256 scanlines per
+    /// chunk, plus packed and scratch space), so this is deliberately bounded.
+    int decoder_pool_cap() const
+    {
+        int t = threads();
+        if (t <= 0)  // 0 means "use the default"
+            t = default_thread_pool()->size() + 1;
+        return clamp(t, 1, 32);
+    }
+
+    /// Take exclusive ownership of a decoder, preferring one that already holds
+    /// the chunk we are about to read so that its decompressed data can be
+    /// reused. Falls back to the most recently returned one, or a fresh one if
+    /// the pool is empty. Never returns null.
+    std::unique_ptr<ChunkDecoder> checkout_decoder(exr_const_context_t ctx,
+                                                   int subimage,
+                                                   int32_t chunkidx)
+    {
+        {
+            spin_lock lock(m_decoder_pool_mutex);
+            if (!m_decoder_pool.empty()) {
+                // Default to the most recent (LIFO), which is what keeps a
+                // single-threaded sequential walk hitting the same decoder.
+                size_t pick = m_decoder_pool.size() - 1;
+                for (size_t i = 0, e = m_decoder_pool.size(); i < e; ++i) {
+                    const ChunkDecoder* c = m_decoder_pool[i].get();
+                    if (c->cached_context == ctx
+                        && c->cached_subimage == subimage
+                        && c->cached_chunk_idx == chunkidx) {
+                        pick = i;
+                        break;
+                    }
+                }
+                auto cd = std::move(m_decoder_pool[pick]);
+                m_decoder_pool.erase(m_decoder_pool.begin()
+                                     + ptrdiff_t(pick));
+                return cd;
+            }
+        }
+        return std::unique_ptr<ChunkDecoder>(new ChunkDecoder);
+    }
+
+    /// Hand a decoder back for reuse, or let it be destroyed if we already have
+    /// as many as we're willing to keep.
+    void checkin_decoder(std::unique_ptr<ChunkDecoder>& cd)
+    {
+        spin_lock lock(m_decoder_pool_mutex);
+        if (int(m_decoder_pool.size()) < decoder_pool_cap())
+            m_decoder_pool.push_back(std::move(cd));
     }
 
     bool valid_file_or_proxy(const std::string& filename,
@@ -417,6 +688,14 @@ OpenEXRCoreInput::open(const std::string& name, ImageSpec& newspec,
     if (m_userdata.m_io) {
         cinit.read_fn = &oiio_exr_read_func;
         cinit.size_fn = &oiio_exr_query_size_func;
+    }
+
+    // Any cached decode pipelines belong to the context we're about to
+    // replace, and destroying one needs its context, so drop them while it is
+    // still valid. (open() need not have been preceded by close().)
+    {
+        spin_lock lock(m_decoder_pool_mutex);
+        m_decoder_pool.clear();
     }
 
     exr_result_t rv = exr_start_read(&m_exr_context, name.c_str(), &cinit);
@@ -1207,6 +1486,12 @@ OpenEXRCoreInput::spec_dimensions(int subimage, int miplevel)
 bool
 OpenEXRCoreInput::close()
 {
+    // Destroy the cached decode pipelines first: exr_decoding_destroy needs the
+    // context, so this must happen before exr_finish tears it down.
+    {
+        spin_lock lock(m_decoder_pool_mutex);
+        m_decoder_pool.clear();
+    }
     exr_finish(&m_exr_context);
     init();  // Reset to initial state
     return true;
@@ -1289,70 +1574,49 @@ OpenEXRCoreInput::read_native_scanlines(int subimage, int miplevel, int ybegin,
     parallel_for_chunked(
         ychunkstart, yend, scansperchunk,
         [&](int64_t yb, int64_t ye) {
+            // The first scanline of this chunk that the caller actually wants.
+            // Only the first chunk can start partway in.
             int y = std::max(int(yb), ybegin);
             DBGEXR("reading y={}\n", y);
             uint8_t* linedata = static_cast<uint8_t*>(data)
                                 + scanlinebytes * (y - ybegin);
-            default_init_vector<uint8_t> fullchunk;
-            int nlines = scansperchunk;
+
+            // Lines we want from this chunk, assuming a full-height chunk. Only
+            // used if we can't get the real chunk geometry below.
+            int cstart = spec.y
+                         + round_down_to_multiple(y - spec.y, scansperchunk);
+            int nlines = std::min(yend, cstart + scansperchunk) - y;
+
             exr_chunk_info_t cinfo;
-            exr_decode_pipeline_t decoder = EXR_DECODE_PIPELINE_INITIALIZER;
-            DecoderDestroyer dd(m_exr_context, &decoder);
-            // Note: the decoder will be destroyed by dd exiting scope
-            uint8_t* cdata = linedata;
-            // handle scenario where caller asked us to read a scanline
-            // that isn't aligned to a chunk boundary
-            int invalid = (y - spec.y) % scansperchunk;
-            if (invalid != 0) {
-                // Our first scanline, ybegin, is not on a chunk boundary.
-                // We'll need to "back up" and read a whole chunk.
-                fullchunk.resize(scanlinebytes * scansperchunk);
-                cdata  = fullchunk.data();
-                nlines = scansperchunk - invalid;
-                y      = y - invalid;
-            } else if ((y + scansperchunk) > yend && yend < endy) {
-                // ybegin is at a chunk boundary, but yend is not (and isn't
-                // the special case of it encompassing the end of the image,
-                // which is not at a chunk boundary). We'll need to read a
-                // full chunk and use only part of it.
-                fullchunk.resize(scanlinebytes * scansperchunk);
-                cdata  = fullchunk.data();
-                nlines = yend - y;
-            } else {
-                // We need a full aligned chunk. Everything is already set up.
-            }
             exr_result_t rv = exr_read_scanline_chunk_info(m_exr_context,
                                                            subimage, y, &cinfo);
-            if (rv == EXR_ERR_SUCCESS)
-                rv = exr_decoding_initialize(m_exr_context, subimage, &cinfo,
-                                             &decoder);
             if (rv == EXR_ERR_SUCCESS) {
-                size_t chanoffset = 0;
-                for (int c = chbegin; c < chend; ++c) {
-                    size_t chanbytes  = spec.channelformat(c).size();
-                    string_view cname = spec.channel_name(c);
-                    for (int dc = 0; dc < decoder.channel_count; ++dc) {
-                        exr_coding_channel_info_t& curchan
-                            = decoder.channels[dc];
-                        if (cname == curchan.channel_name) {
-                            curchan.decode_to_ptr     = cdata + chanoffset;
-                            curchan.user_pixel_stride = pixelbytes;
-                            curchan.user_line_stride  = scanlinebytes;
-                            chanoffset += chanbytes;
-                            break;
-                        }
-                    }
+                // Ask the library to skip the lines ahead of the ones we want
+                // and ignore the ones after, so it can decode straight into the
+                // caller's buffer. Use the chunk's real height, which is short
+                // for a final partial chunk.
+                int skip = y - cinfo.start_y;
+                nlines   = std::min(yend, cinfo.start_y + cinfo.height) - y;
+
+                auto cd = checkout_decoder(m_exr_context, subimage, cinfo.idx);
+                if (cd->can_reuse(m_exr_context, subimage, cinfo.idx, chbegin,
+                                  chend, pixelbytes, scanlinebytes)) {
+                    // We already have this chunk decompressed, so just unpack
+                    // the requested lines out of it again.
+                    DBGEXR("chunk {} hit, unpack only\n", cinfo.idx);
+                    rv = cd->unpack_only(spec, chbegin, chend, linedata, skip,
+                                         nlines, pixelbytes, scanlinebytes);
+                } else {
+                    rv = cd->decode(m_exr_context, subimage, cinfo, spec,
+                                    chbegin, chend, linedata, skip, nlines,
+                                    pixelbytes, scanlinebytes);
                 }
-                rv = exr_decoding_choose_default_routines(m_exr_context,
-                                                          subimage, &decoder);
+                checkin_decoder(cd);
             }
-            if (rv == EXR_ERR_SUCCESS)
-                rv = exr_decoding_run(m_exr_context, subimage, &decoder);
             if (rv != EXR_ERR_SUCCESS) {
                 if (check_fill_missing(spec.x, spec.x + spec.width, y,
                                        y + nlines, 0, 1, chbegin, chend,
-                                       cdata + invalid * scanlinebytes,
-                                       pixelbytes, scanlinebytes)) {
+                                       linedata, pixelbytes, scanlinebytes)) {
                     // clear the error
                     DBGEXR("cfm true y={} {}-{}\n", y, yb, ye);
                     rv = EXR_ERR_SUCCESS;
@@ -1360,12 +1624,6 @@ OpenEXRCoreInput::read_native_scanlines(int subimage, int miplevel, int ybegin,
                     DBGEXR("cfm false {}-{}\n", yb, ye);
                     ok = false;
                 }
-            }
-            if (rv == EXR_ERR_SUCCESS && cdata != linedata) {
-                y += invalid;
-                nlines = std::min(nlines, yend - y);
-                memcpy(linedata, cdata + invalid * scanlinebytes,
-                       nlines * scanlinebytes);
             }
         },
         threads());
