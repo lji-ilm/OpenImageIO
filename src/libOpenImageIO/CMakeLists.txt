@@ -97,6 +97,8 @@ if (EMBEDPLUGINS)
     endforeach ()
 endif ()
 
+message(STATUS "LIBOpenImageIO -- OpenEXR Version is (before override):" ${OPENEXR_VERSION})
+set(OPENEXR_VERSION 3.4.13)
 # Enable default use of OpenEXR core library for versions of the library
 # new enough to support DWA compression in exrcore.
 if (OPENEXR_VERSION VERSION_GREATER_EQUAL 3.1.10)

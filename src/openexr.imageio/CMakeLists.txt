@@ -6,10 +6,13 @@ set (openexr_src exrinput.cpp exroutput.cpp)
 
 option (OIIO_USE_EXR_C_API "Allow use of the new exr 3.1 C API if available" ON)
 if (OIIO_USE_EXR_C_API AND TARGET OpenEXR::OpenEXRCore)
+    message (STATUS "OpenEXR C API Allowed")
     set (openexr_defs OIIO_USE_EXR_C_API=1)
     list (APPEND openexr_src exrinput_c.cpp)
 endif()
 
+message(STATUS "OpenEXR.imageIO -- OpenEXR Version is (before override):" ${OPENEXR_VERSION})
+set(OPENEXR_VERSION 3.4.13)
 # Enable default use of OpenEXR core library for versions of the library
 # new enough to support DWA compression in exrcore.
 if (OPENEXR_VERSION VERSION_GREATER_EQUAL 3.1.10)
