@@ -10,6 +10,7 @@
 #include <OpenImageIO/imagecache.h>
 #include <OpenImageIO/imageio.h>
 #include <OpenImageIO/strutil.h>
+#include <OpenImageIO/sysutil.h>
 #include <OpenImageIO/timer.h>
 #include <OpenImageIO/unittest.h>
 #include <OpenImageIO/ustring.h>
@@ -35,8 +36,10 @@ static std::string output_format;
 static std::vector<char> buffer;
 static ImageSpec bufspec, outspec;
 static std::shared_ptr<ImageCache> imagecache;
-static imagesize_t total_image_pixels = 0;
-static float cache_size               = 0;
+static imagesize_t total_image_pixels    = 0;
+static imagesize_t half_scanlines_pixels = 0;
+static imagesize_t half_tiles_pixels     = 0;
+static float cache_size                  = 0;
 
 
 
@@ -54,7 +57,7 @@ getargs(int argc, char* argv[])
     ap.arg("-v", &verbose)
       .help("Verbose mode");
     ap.arg("--threads %d", &numthreads)
-      .help(Strutil::fmt::format("Number of threads (default: {})", numthreads));
+      .help(Strutil::fmt::format("Number of threads -- 0 means using available hardware threads (default: {})", numthreads));
     ap.arg("--iters %d", &iterations)
       .help(Strutil::fmt::format("Number of iterations (default: {})", iterations));
     ap.arg("--trials %d", &ntrials)
@@ -139,6 +142,207 @@ time_read_64_scanlines_at_a_time()
 
 
 
+// Bytes per pixel of the data that ImageInput reads deliver, given the
+// requested `conversion` (UNKNOWN means native).
+static size_t
+read_pixel_size(const ImageSpec& spec)
+{
+    size_t pixelsize = spec.nchannels * conversion.size();
+    if (!pixelsize)
+        pixelsize = spec.pixel_bytes(true);  // UNKNOWN -> native
+    return pixelsize;
+}
+
+
+
+// Address within buffer[] of pixel (x,y,z), where buffer[] holds the
+// whole image laid out contiguously in the shape of its data window.
+static char*
+buffer_addr(const ImageSpec& spec, size_t pixelsize, int x, int y, int z)
+{
+    imagesize_t offset = (imagesize_t(z - spec.z) * spec.height
+                          + imagesize_t(y - spec.y))
+                             * spec.width
+                         + imagesize_t(x - spec.x);
+    return &buffer[offset * pixelsize];
+}
+
+
+
+// The region read by time_read_half_scanlines: the center 50% of the
+// scanlines, all x and z. Empty ROI if the image has too few scanlines.
+static ROI
+half_scanlines_roi(const ImageSpec& spec)
+{
+    int ybegin = spec.y + int(spec.height * 0.25);
+    int yend   = spec.y + int(spec.height * 0.75);
+    if (yend <= ybegin)
+        return ROI();
+    return ROI(spec.x, spec.x + spec.width, ybegin, yend, spec.z,
+               spec.z + spec.depth);
+}
+
+
+
+// The region read by time_read_half_tiles: the center 50% of the pixels,
+// i.e. from (1 - 1/sqrt(2))/2 = 0.1464 to 0.8536 of the width and height
+// (all z), expanded outward to the enclosing tile boundaries (or image
+// edge), because read_tiles() only accepts tile-aligned ranges. Empty ROI
+// if the image is not tiled or is too small.
+static ROI
+half_tiles_roi(const ImageSpec& spec)
+{
+    if (spec.tile_width <= 0 || spec.tile_height <= 0)
+        return ROI();
+    int xbegin = spec.x + int(spec.width * 0.1464);
+    int xend   = spec.x + int(spec.width * 0.8536);
+    int ybegin = spec.y + int(spec.height * 0.1464);
+    int yend   = spec.y + int(spec.height * 0.8536);
+    if (xend <= xbegin || yend <= ybegin)
+        return ROI();
+    // All values are >= origin, so int division rounds down as needed.
+    auto snap_down = [](int v, int origin, int tile) {
+        return origin + ((v - origin) / tile) * tile;
+    };
+    auto snap_up = [](int v, int origin, int tile, int end) {
+        return std::min(origin + ((v - origin + tile - 1) / tile) * tile, end);
+    };
+    return ROI(snap_down(xbegin, spec.x, spec.tile_width),
+               snap_up(xend, spec.x, spec.tile_width, spec.x + spec.width),
+               snap_down(ybegin, spec.y, spec.tile_height),
+               snap_up(yend, spec.y, spec.tile_height, spec.y + spec.height),
+               spec.z, spec.z + spec.depth);
+}
+
+
+
+// Read the center 50% of the scanlines in one read_scanlines call (per z
+// slice), placing them where they belong in the full-image buffer.
+static void
+time_read_half_scanlines()
+{
+    for (ustring filename : input_filename) {
+        auto in = ImageInput::open(filename.c_str());
+        OIIO_ASSERT(in);
+        const ImageSpec& spec(in->spec());
+        ROI roi = half_scanlines_roi(spec);
+        if (roi.defined()) {  // too-small images are skipped & not counted
+            size_t pixelsize = read_pixel_size(spec);
+            for (int z = roi.zbegin; z < roi.zend; ++z) {
+                bool ok = in->read_scanlines(
+                    /*subimage=*/0, /*miplevel=*/0, roi.ybegin, roi.yend, z, 0,
+                    spec.nchannels, conversion,
+                    buffer_addr(spec, pixelsize, roi.xbegin, roi.ybegin, z));
+                OIIO_ASSERT(ok);
+            }
+        }
+        in->close();
+    }
+}
+
+
+
+// Read the image one tile per read_tiles call, placing each tile where it
+// belongs in the full-image buffer.
+static void
+time_read_one_tile_at_a_time()
+{
+    for (ustring filename : input_filename) {
+        auto in = ImageInput::open(filename.c_str());
+        OIIO_ASSERT(in);
+        const ImageSpec& spec(in->spec());
+        OIIO_DASSERT(spec.tile_width > 0 && spec.tile_height > 0);
+        size_t pixelsize = read_pixel_size(spec);
+        stride_t xstride = pixelsize;
+        stride_t ystride = xstride * spec.width;
+        stride_t zstride = ystride * spec.height;
+        int tile_depth   = std::max(spec.tile_depth, 1);
+        int xend         = spec.x + spec.width;
+        int yend         = spec.y + spec.height;
+        int zend         = spec.z + spec.depth;
+        for (int z = spec.z; z < zend; z += tile_depth) {
+            for (int y = spec.y; y < yend; y += spec.tile_height) {
+                for (int x = spec.x; x < xend; x += spec.tile_width) {
+                    bool ok = in->read_tiles(
+                        /*subimage=*/0, /*miplevel=*/0, x,
+                        std::min(x + spec.tile_width, xend), y,
+                        std::min(y + spec.tile_height, yend), z,
+                        std::min(z + tile_depth, zend), 0, spec.nchannels,
+                        conversion, buffer_addr(spec, pixelsize, x, y, z),
+                        xstride, ystride, zstride);
+                    OIIO_ASSERT(ok);
+                }
+            }
+        }
+        in->close();
+    }
+}
+
+
+
+// Read the image one full row of tiles per read_tiles call.
+static void
+time_read_tile_row_at_a_time()
+{
+    for (ustring filename : input_filename) {
+        auto in = ImageInput::open(filename.c_str());
+        OIIO_ASSERT(in);
+        const ImageSpec& spec(in->spec());
+        OIIO_DASSERT(spec.tile_width > 0 && spec.tile_height > 0);
+        size_t pixelsize = read_pixel_size(spec);
+        stride_t xstride = pixelsize;
+        stride_t ystride = xstride * spec.width;
+        stride_t zstride = ystride * spec.height;
+        int tile_depth   = std::max(spec.tile_depth, 1);
+        int yend         = spec.y + spec.height;
+        int zend         = spec.z + spec.depth;
+        for (int z = spec.z; z < zend; z += tile_depth) {
+            for (int y = spec.y; y < yend; y += spec.tile_height) {
+                bool ok = in->read_tiles(
+                    /*subimage=*/0, /*miplevel=*/0, spec.x, spec.x + spec.width,
+                    y, std::min(y + spec.tile_height, yend), z,
+                    std::min(z + tile_depth, zend), 0, spec.nchannels,
+                    conversion, buffer_addr(spec, pixelsize, spec.x, y, z),
+                    xstride, ystride, zstride);
+                OIIO_ASSERT(ok);
+            }
+        }
+        in->close();
+    }
+}
+
+
+
+// Read the tiles covering the center 50% of the pixels (see
+// half_tiles_roi) in a single read_tiles call, placing them where they
+// belong in the full-image buffer.
+static void
+time_read_half_tiles()
+{
+    for (ustring filename : input_filename) {
+        auto in = ImageInput::open(filename.c_str());
+        OIIO_ASSERT(in);
+        const ImageSpec& spec(in->spec());
+        ROI roi = half_tiles_roi(spec);
+        if (roi.defined()) {  // too-small images are skipped & not counted
+            size_t pixelsize = read_pixel_size(spec);
+            stride_t xstride = pixelsize;
+            stride_t ystride = xstride * spec.width;
+            stride_t zstride = ystride * spec.height;
+            char* dst = buffer_addr(spec, pixelsize, roi.xbegin, roi.ybegin,
+                                    roi.zbegin);
+            bool ok   = in->read_tiles(
+                /*subimage=*/0, /*miplevel=*/0, roi.xbegin, roi.xend,
+                roi.ybegin, roi.yend, roi.zbegin, roi.zend, 0, spec.nchannels,
+                conversion, dst, xstride, ystride, zstride);
+            OIIO_ASSERT(ok);
+        }
+        in->close();
+    }
+}
+
+
+
 static void
 time_read_imagebuf()
 {
@@ -165,15 +369,20 @@ time_ic_get_pixels()
 
 
 
+// Time `func`, and report its rate as `npixels` per second. A `npixels`
+// of 0 means the full image pixel count of all input files, for tests that
+// read the whole images.
 static void
 test_read(const std::string& explanation, void (*func)(), int autotile = 64,
-          int autoscanline = 1)
+          int autoscanline = 1, imagesize_t npixels = 0)
 {
     imagecache->invalidate_all(true);  // Don't hold anything
     imagecache->attribute("autotile", autotile);
     imagecache->attribute("autoscanline", autoscanline);
+    if (!npixels)
+        npixels = total_image_pixels;
     double t    = time_trial(func, ntrials);
-    double rate = double(total_image_pixels) / t;
+    double rate = double(npixels) / t;
     OIIO::print("  {}: {} = {:5.1f} Mpel/s\n", explanation,
                 Strutil::timeintervalformat(t, 2), rate / 1.0e6);
 }
@@ -492,6 +701,18 @@ main(int argc, char** argv)
 
     OIIO::attribute("threads", numthreads);
     OIIO::attribute("exr_threads", numthreads);
+    // "threads" is resolved by OIIO (0 -> env var or hardware concurrency),
+    // so querying it gives the actual count. "exr_threads" is stored raw;
+    // mirror the openexr plugin's interpretation (0 -> hardware concurrency,
+    // -1 -> single-threaded).
+    int exr_threads = OIIO::get_int_attribute("exr_threads");
+    if (exr_threads == 0)
+        exr_threads = int(Sysutil::hardware_concurrency());
+    else if (exr_threads < 0)
+        exr_threads = 1;
+    print("Using {} threads (OpenEXR: {}, hardware: {})\n",
+          OIIO::get_int_attribute("threads"), exr_threads,
+          Sysutil::hardware_concurrency());
     conversion.fromstring(conversionname);
 
     imagecache = ImageCache::create();
@@ -501,6 +722,7 @@ main(int argc, char** argv)
 
     // Allocate a buffer big enough (for floats)
     bool all_scanline       = true;
+    bool all_tile           = true;
     total_image_pixels      = 0;
     imagesize_t maxpelchans = 0;
     for (auto&& fn : input_filename) {
@@ -512,7 +734,11 @@ main(int argc, char** argv)
         total_image_pixels += spec.image_pixels();
         maxpelchans = std::max(maxpelchans,
                                spec.image_pixels() * spec.nchannels);
-        all_scanline &= (spec.tile_width == 0);
+        bool this_is_scanline = (spec.tile_width == 0);
+        all_scanline &= this_is_scanline;
+        all_tile &= !this_is_scanline;
+        half_scanlines_pixels += half_scanlines_roi(spec).npixels();
+        half_tiles_pixels += half_tiles_roi(spec).npixels();
     }
     imagecache->invalidate_all(true);  // Don't hold anything
 
@@ -532,6 +758,25 @@ main(int argc, char** argv)
                       time_read_scanline_at_a_time, 0, 0);
             test_read("read_scanlines (64 at a time)                ",
                       time_read_64_scanlines_at_a_time, 0, 0);
+            if (half_scanlines_pixels)
+                test_read("read_scanlines (center 50%)                  ",
+                          time_read_half_scanlines, 0, 0,
+                          half_scanlines_pixels);
+            else
+                OIIO::print("  read_scanlines (center 50%) skipped: "
+                            "images have too few scanlines\n");
+        }
+        if (all_tile) {
+            test_read("read_tiles (1 tile at a time)                ",
+                      time_read_one_tile_at_a_time, 0, 0);
+            test_read("read_tiles (1 row of tiles at a time)        ",
+                      time_read_tile_row_at_a_time, 0, 0);
+            if (half_tiles_pixels)
+                test_read("read_tiles (center 50%)                      ",
+                          time_read_half_tiles, 0, 0, half_tiles_pixels);
+            else
+                OIIO::print("  read_tiles (center 50%) skipped: "
+                            "images are too small\n");
         }
         test_read("ImageBuf read                                ",
                   time_read_imagebuf, 0, 0);
