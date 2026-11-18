@@ -384,7 +384,7 @@ test_read(const std::string& explanation, void (*func)(), int autotile = 64,
     double t    = time_trial(func, ntrials);
     double rate = double(npixels) / t;
     OIIO::print("  {}: {} = {:5.1f} Mpel/s\n", explanation,
-                Strutil::timeintervalformat(t, 2), rate / 1.0e6);
+                Strutil::timeintervalformat(t, 6), rate / 1.0e6);
 }
 
 
